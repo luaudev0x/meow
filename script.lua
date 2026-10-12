@@ -5,18 +5,26 @@
 -- ╚══════════════════════════════════════╝
 
 local VALID_KEY = "123"
-local MARKER_PATH = "vsphone/zxElneSOnwxB3FyV.ULpYp0d4jbzYRoif.AL0GNGUyQVX2Z24q.key"
 local MARKER_VALUE = "1"
+local MARKER_PATHS = {
+    "vsphone/zxElneSOnwxB3FyV.ULpYp0d4jbzYRoif.AL0GNGUyQVX2Z24q.key",
+    "Workspace/vsphone/zxElneSOnwxB3FyV.ULpYp0d4jbzYRoif.AL0GNGUyQVX2Z24q.key",
+}
 
 local function isVsPhoneRuntime()
     if type(isfile) ~= "function" or type(readfile) ~= "function" then
         return false
     end
-    local ok, val = pcall(function()
-        if not isfile(MARKER_PATH) then return nil end
-        return readfile(MARKER_PATH)
-    end)
-    return ok and val == MARKER_VALUE
+    for _, path in ipairs(MARKER_PATHS) do
+        local ok, val = pcall(function()
+            if not isfile(path) then return nil end
+            return readfile(path)
+        end)
+        if ok and val == MARKER_VALUE then
+            return true
+        end
+    end
+    return false
 end
 
 local function showKeySystem()
