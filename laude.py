@@ -8,7 +8,7 @@ except:
     import psutil
 
 try:
-    import urllib.request,urllib.parse
+    import urllib.request,urllib.parse,urllib.error
 except:pass
 
 ROBLOX_PKG="com.roblox.client"
@@ -73,8 +73,8 @@ DEFAULT_CFG={
     "webhook_url":"",
     "webhook_interval":60,
     "webhook_enabled":False,
-    "server_mode":"off",      # off / highest / lowest
-    "roblosecurity":"",       # .ROBLOSECURITY cookie value
+    "server_mode":"off",
+    "roblosecurity":"",
 }
 
 def load_config():
@@ -301,7 +301,6 @@ def settings_menu(cfg):
             v=inp(".ROBLOSECURITY","")
             if v:
                 v=v.strip()
-                if v.startswith("_|"):v=v  # already raw
                 cfg["roblosecurity"]=v
                 print(cl("  ✓ Cookie saved","92"))
             time.sleep(0.8)
@@ -425,7 +424,7 @@ def take_screenshot():
     return None
 
 # ══════════════════════════════════════════════════
-# SMALL CAPS + GAME INFO + PROCESS STATS
+# SMALL CAPS
 # ══════════════════════════════════════════════════
 _SMALL_CAPS="aᴀbʙcᴄdᴅeᴇfꜰgɢhʜiɪjᴊkᴋlʟmᴍnɴoᴏpᴘqǫrʀsꜱtᴛuᴜvᴠwᴡxхyʏzᴢ"
 def to_small_caps(text):
@@ -444,19 +443,100 @@ def to_small_caps(text):
 _game_name_cache={}
 _universe_id_cache={}
 
-# Hard-coded universe IDs for games where the API lookup returns wrong/stale
-# values.  Key = place_id string, value = universe_id int.
-# These are used as the FIRST source before any API call.
 KNOWN_UNIVERSE_IDS={
-    # Steal An Egg  (place 107778070777162 → universe 10563114921)
     "107778070777162": 10563114921,
 }
 
+# ══════════════════════════════════════════════════
+# CSRF TOKEN
+# Roblox requires x-csrf-token on authenticated API
+# calls including GET /games/v1/games/.../servers.
+# We obtain it by sending a POST to /v1/logout with
+# the cookie; Roblox returns 403 + the token in the
+# x-csrf-token response header (standard pattern).
+# ══════════════════════════════════════════════════
+_csrf_token_cache=None
+_csrf_token_lock=threading.Lock()
+
+def fetch_csrf_token(cookie):
+    """
+    Obtain a fresh x-csrf-token from Roblox.
+    Strategy: POST https://auth.roblox.com/v1/logout with the cookie.
+    Roblox always rejects this with HTTP 403 and puts the token in the
+    x-csrf-token response header.  We never actually log out — we just
+    read that header and discard the response body.
+
+    Returns the token string, or None on failure.
+    """
+    url="https://auth.roblox.com/v1/logout"
+
+    # Method 1: curl — capture response headers with -D -
+    try:
+        cmd=[
+            "curl","-s","--compressed","--location",
+            "--max-time","10",
+            "-A","RobloxRejoin/5.2",
+            "-X","POST",
+            "--cookie",f".ROBLOSECURITY={cookie}",
+            "-H","Content-Length: 0",
+            "-D","-",   # dump response headers to stdout
+            url
+        ]
+        r=subprocess.run(cmd,capture_output=True,text=True,timeout=12)
+        for line in r.stdout.splitlines():
+            if line.lower().startswith("x-csrf-token:"):
+                token=line.split(":",1)[1].strip()
+                log(f"CSRF token obtained via curl: {token[:8]}...","OK")
+                return token
+    except Exception as e:
+        log(f"fetch_csrf_token curl failed: {e}","WARN")
+
+    # Method 2: urllib
+    try:
+        req=urllib.request.Request(
+            url,
+            data=b"",
+            headers={
+                "User-Agent":"RobloxRejoin/5.2",
+                "Cookie":f".ROBLOSECURITY={cookie}",
+                "Content-Length":"0",
+            },
+            method="POST"
+        )
+        try:
+            urllib.request.urlopen(req,timeout=10)
+        except urllib.error.HTTPError as e:
+            token=e.headers.get("x-csrf-token","")
+            if token:
+                log(f"CSRF token obtained via urllib: {token[:8]}...","OK")
+                return token
+    except Exception as e:
+        log(f"fetch_csrf_token urllib failed: {e}","WARN")
+
+    log("fetch_csrf_token: could not obtain token","WARN")
+    return None
+
+def get_csrf_token(cookie, force_refresh=False):
+    """Return cached CSRF token, refreshing if needed."""
+    global _csrf_token_cache
+    with _csrf_token_lock:
+        if not force_refresh and _csrf_token_cache:
+            return _csrf_token_cache
+        token=fetch_csrf_token(cookie)
+        if token:
+            _csrf_token_cache=token
+        return token
+
+def invalidate_csrf_token():
+    global _csrf_token_cache
+    with _csrf_token_lock:
+        _csrf_token_cache=None
+
+# ══════════════════════════════════════════════════
+# UNIVERSE ID HELPERS
+# ══════════════════════════════════════════════════
 def _fetch_universe_id_fresh(place_id):
-    """Hit the Roblox API (curl first, urllib fallback) and return universeId
-    as an int, or None.  Does NOT touch the cache."""
     url=f"https://apis.roblox.com/universes/v1/places/{place_id}/universe"
-    # Method 1: curl (avoids Termux SSL issues)
     try:
         r=subprocess.run(
             ["curl","-s","--compressed","--max-time","8",
@@ -474,7 +554,6 @@ def _fetch_universe_id_fresh(place_id):
                 return uid
     except Exception as e:
         log(f"get_universe_id curl failed ({e}), trying urllib...","WARN")
-    # Method 2: urllib fallback
     try:
         req=urllib.request.Request(url,headers={"User-Agent":"RobloxRejoin/5.2"})
         with urllib.request.urlopen(req,timeout=8) as r:
@@ -486,15 +565,10 @@ def _fetch_universe_id_fresh(place_id):
     return None
 
 def get_universe_id(place_id, force_refresh=False):
-    """Return universeId for a place_id (cached).
-    Priority: KNOWN_UNIVERSE_IDS table → cache → live API lookup."""
-    # 1. Known-good override table (always wins unless caller forces refresh)
     if not force_refresh and place_id in KNOWN_UNIVERSE_IDS:
         return KNOWN_UNIVERSE_IDS[place_id]
-    # 2. In-memory cache (skip if caller wants a fresh lookup)
     if not force_refresh and place_id in _universe_id_cache:
         return _universe_id_cache[place_id]
-    # 3. Live API call
     uid=_fetch_universe_id_fresh(place_id)
     if uid is not None:
         _universe_id_cache[place_id]=uid
@@ -508,7 +582,7 @@ def get_game_name(place_id):
         if uid is None:return None
         req2=urllib.request.Request(
             f"https://games.roblox.com/v1/games?universeIds={uid}",
-            headers={"User-Agent":"RobloxRejoin/5.1"}
+            headers={"User-Agent":"RobloxRejoin/5.2"}
         )
         with urllib.request.urlopen(req2,timeout=5) as r2:
             name=json.loads(r2.read())["data"][0]["name"]
@@ -517,31 +591,29 @@ def get_game_name(place_id):
     except:pass
     return None
 
-def _curl_get_json(url, cookie=None, timeout=12):
+# ══════════════════════════════════════════════════
+# HTTP HELPERS — curl + urllib with CSRF token
+# ══════════════════════════════════════════════════
+def _curl_get_json(url, cookie=None, csrf_token=None, timeout=12):
     """
-    Fetch a URL with curl and return parsed JSON, or None on failure.
+    Fetch URL with curl and return parsed JSON, or None on failure.
 
-    Key design choices vs the old approach:
-      • No -f flag: curl -f exits nonzero (code 22) on HTTP 4xx/5xx and
-        discards the response body, so we never saw Roblox's error message
-        and our `if r.returncode==0` check silently discarded the failure.
-        Without -f, curl always exits 0 on a completed request; we inspect
-        the JSON body ourselves.
-      • --compressed: Roblox APIs send gzip by default; without this flag
-        curl may receive garbled binary data instead of JSON.
-      • --location (-L): follow any redirects (rare but possible).
-      • Cookie passed via --cookie flag (separate argument from its value)
-        so no shell-quoting issues even if the token contains special chars.
-      • We log the first 200 chars of any non-JSON or error response so the
-        caller can diagnose auth/API problems without guesswork.
+    Changes vs original:
+      • Passes x-csrf-token header when provided — required by Roblox's
+        server list endpoint even for GET requests.
+      • Returns the raw error dict (not None) when Roblox returns a JSON
+        error body, so callers can inspect the error code.
+      • No -f: we read the body ourselves.
+      • --compressed: handle gzip.
     """
     cmd=["curl","-s","--compressed","--location",
          "--max-time",str(timeout),
          "-A","RobloxRejoin/5.2",
          "-H","Accept: application/json"]
     if cookie:
-        # --cookie keeps the name=value together; no shell expansion risk
         cmd+=["--cookie",f".ROBLOSECURITY={cookie}"]
+    if csrf_token:
+        cmd+=["-H",f"x-csrf-token: {csrf_token}"]
     cmd.append(url)
     try:
         r=subprocess.run(cmd,capture_output=True,text=True,timeout=timeout+2)
@@ -551,11 +623,7 @@ def _curl_get_json(url, cookie=None, timeout=12):
             log(f"curl empty response (exit {r.returncode}){': '+stderr[:80] if stderr else ''}","WARN")
             return None
         data=json.loads(raw)
-        # Roblox wraps API errors like {"errors":[{"code":0,"message":"..."}]}
-        if isinstance(data,dict) and data.get("errors"):
-            errs=data["errors"]
-            log(f"curl API error: {errs[0].get('message','unknown')} (code {errs[0].get('code','?')})","WARN")
-            return None
+        # Return the dict even if it contains errors — caller decides
         return data
     except json.JSONDecodeError:
         log(f"curl non-JSON response: {r.stdout[:200]}","WARN")
@@ -563,50 +631,69 @@ def _curl_get_json(url, cookie=None, timeout=12):
         log(f"curl failed: {e}","WARN")
     return None
 
-def _fetch_servers_with_uid(uid, cookie, mode, place_id):
+def _urllib_get_json(url, cookie=None, csrf_token=None, timeout=10):
+    """urllib fallback with CSRF token support."""
+    headers={
+        "User-Agent":"RobloxRejoin/5.2",
+        "Accept":"application/json",
+    }
+    if cookie:
+        headers["Cookie"]=f".ROBLOSECURITY={cookie}"
+    if csrf_token:
+        headers["x-csrf-token"]=csrf_token
+    try:
+        req=urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        body=e.read().decode("utf-8","ignore")
+        log(f"urllib HTTP {e.code}: {body[:200]}","WARN")
+        # Try to parse Roblox error JSON from the 4xx body
+        try:
+            return json.loads(body)
+        except:pass
+    except Exception as e:
+        log(f"urllib failed: {e}","WARN")
+    return None
+
+def _api_get_json(url, cookie=None, csrf_token=None, timeout=12):
     """
-    Inner: fetch server pages for a known uid and return list of raw server
-    dicts, or None if every attempt fails.  Shared by get_servers() so it
-    can retry with a different uid on 'place invalid' errors.
+    Try curl then urllib.  If either returns a Roblox errors dict, log it
+    and return None.  Returns parsed data dict on success.
+    """
+    data=_curl_get_json(url, cookie=cookie, csrf_token=csrf_token, timeout=timeout)
+    if data is None:
+        data=_urllib_get_json(url, cookie=cookie, csrf_token=csrf_token, timeout=timeout)
+    if data is None:
+        return None
+    if isinstance(data, dict) and data.get("errors"):
+        errs=data["errors"]
+        msg=errs[0].get("message","unknown")
+        code=errs[0].get("code","?")
+        log(f"API error: {msg} (code {code})","WARN")
+        return None
+    return data
+
+# ══════════════════════════════════════════════════
+# SERVER LIST
+# ══════════════════════════════════════════════════
+def _fetch_servers_with_uid(uid, cookie, csrf_token, mode, place_id):
+    """
+    Fetch server pages for a known uid.  Returns list of raw server dicts,
+    or None if every attempt fails.
     """
     sort_order="Asc" if mode=="lowest" else "Desc"
     all_servers=[]
     cursor=""
 
     for page in range(2):
-        # NOTE: Roblox's server list API requires placeId as a query param
-        # in addition to universeId in the path, otherwise it returns
-        # {"errors":[{"code":1,"message":"The place is invalid."}]}
         url=(
             f"https://games.roblox.com/v1/games/{uid}/servers/Public"
             f"?placeId={place_id}&limit=100&sortOrder={sort_order}"
             +(f"&cursor={urllib.parse.quote(cursor)}" if cursor else "")
         )
-        data=None
 
-        # Method 1: curl
-        data=_curl_get_json(url, cookie=cookie, timeout=12)
-
-        # Method 2: urllib fallback
-        if data is None:
-            try:
-                req=urllib.request.Request(
-                    url,
-                    headers={
-                        "User-Agent":"RobloxRejoin/5.2",
-                        "Cookie":f".ROBLOSECURITY={cookie}",
-                        "Accept":"application/json",
-                    }
-                )
-                with urllib.request.urlopen(req,timeout=10) as r:
-                    raw=r.read()
-                    data=json.loads(raw)
-                    if isinstance(data,dict) and data.get("errors"):
-                        errs=data["errors"]
-                        log(f"urllib API error: {errs[0].get('message','unknown')}","WARN")
-                        data=None
-            except Exception as e:
-                log(f"get_servers urllib failed: {e}","WARN")
+        data=_api_get_json(url, cookie=cookie, csrf_token=csrf_token, timeout=12)
 
         if data is None:
             log(f"get_servers: both methods failed on page {page+1}","WARN")
@@ -635,12 +722,11 @@ def get_servers(place_id, cookie, mode="highest"):
     Fetch public server list and return (access_code, player_count) of the
     highest- or lowest-populated server, or (None, None) on failure.
 
-    sortOrder=Asc  → emptiest servers on page 1  → use for mode="lowest"
-    sortOrder=Desc → fullest  servers on page 1  → use for mode="highest"
-
-    'The place is invalid (code 1)' means the universeId we passed doesn't
-    match what Roblox expects.  When that happens we bust the cache, force a
-    fresh lookup, and retry once before giving up.
+    Flow:
+      1. Obtain (or reuse cached) CSRF token.
+      2. Fetch servers.
+      3. On failure, invalidate CSRF token, fetch a fresh one, retry once.
+      4. On still-failing with code 1, force-refresh universe ID and retry.
     """
     if not cookie:
         log("get_servers: no .ROBLOSECURITY cookie set","WARN")
@@ -652,23 +738,32 @@ def get_servers(place_id, cookie, mode="highest"):
         return None,None
     log(f"get_servers: using universeId={uid} for place={place_id}","INFO")
 
-    all_servers=_fetch_servers_with_uid(uid, cookie, mode, place_id)
+    # Step 1: get CSRF token (cached OK for first try)
+    csrf=get_csrf_token(cookie)
+    if not csrf:
+        log("get_servers: could not obtain CSRF token — will try without","WARN")
 
-    # If we got nothing AND the uid came from the known table / cache,
-    # try a forced fresh API lookup — the game may have been re-published
-    # under a new universe ID.
+    all_servers=_fetch_servers_with_uid(uid, cookie, csrf, mode, place_id)
+
+    # Step 2: if failed, refresh CSRF token and retry
+    if not all_servers:
+        log("get_servers: retrying with fresh CSRF token...","WARN")
+        invalidate_csrf_token()
+        csrf=get_csrf_token(cookie, force_refresh=True)
+        all_servers=_fetch_servers_with_uid(uid, cookie, csrf, mode, place_id)
+
+    # Step 3: still nothing — try fresh universe ID (not for hardcoded ones)
     if not all_servers and place_id not in KNOWN_UNIVERSE_IDS:
         log("get_servers: retrying with fresh universe ID lookup...","WARN")
         uid2=get_universe_id(place_id, force_refresh=True)
         if uid2 and uid2!=uid:
             log(f"get_servers: got new universeId={uid2}, retrying...","WARN")
-            all_servers=_fetch_servers_with_uid(uid2, cookie, mode, place_id)
+            all_servers=_fetch_servers_with_uid(uid2, cookie, csrf, mode, place_id)
 
     if not all_servers:
         log(f"get_servers: no servers fetched (mode={mode})","WARN")
         return None,None
 
-    # Final filter
     usable=[
         s for s in all_servers
         if s.get("accessCode") and s.get("playing") is not None
@@ -687,7 +782,9 @@ def get_servers(place_id, cookie, mode="highest"):
     log(f"Server selected ({mode}): {count}/{total} players  code={code[:8]}...","OK")
     return code,count
 
-# CPU tracking for Roblox process
+# ══════════════════════════════════════════════════
+# CPU / RAM tracking for Roblox process
+# ══════════════════════════════════════════════════
 _rblx_pid_cache=None
 _rblx_prev_stat=None
 
@@ -881,7 +978,7 @@ def send_webhook(cfg,ram,cpu,reason="status",uptime_secs=0):
             url,data=body,
             headers={
                 "Content-Type":f"multipart/form-data; boundary={boundary}",
-                "User-Agent":"RobloxRejoin/5.1"
+                "User-Agent":"RobloxRejoin/5.2"
             },
             method="POST"
         )
