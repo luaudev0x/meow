@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ZERO X - Verifying...</title>
+  <meta charset="utf-8">
+  <style>
+    body { background: #111; color: #fff; font-family: sans-serif; text-align: center; padding: 50px; }
+    h2 { color: #7289da; }
+  </style>
+</head>
+<body>
+  <h2>🔑 ZERO X Key System</h2>
+  <p>Verifying... please wait.</p>
+  <script>
+    // Get Discord ID from URL param passed by LootLabs redirect
+    const params = new URLSearchParams(window.location.search);
+    const id = params.get('id');
+    if (id) {
+      window.location.href = 'https://meow-1-k118.onrender.com/verify?id=' + id;
+    } else {
+      document.body.innerHTML += '<p style="color:red">❌ Missing Discord ID. Please use /getkey in Discord first.</p>';
+    }
+  </script>
+</body>
+</html>
